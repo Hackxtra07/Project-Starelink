@@ -484,10 +484,14 @@ class MainWindow(QMainWindow):
             if link[3]:
                 item.setToolTip(f"Tags: {link[3]}")
             
+            # Set a white shape instead of the actual thumbnail icon
+            pixmap = QPixmap(100, 75)
+            pixmap.fill(Qt.white)
+            item.setIcon(QIcon(pixmap))
+            
+            # Start background fetcher just to download it (if it doesn't exist)
             local_path = os.path.join(THUMBNAILS_DIR, f"{link[0]}.jpg")
-            if os.path.exists(local_path):
-                item.setIcon(QIcon(local_path))
-            else:
+            if not os.path.exists(local_path):
                 fetcher = ThumbnailFetcher(link[0], link[2])
                 fetcher.finished.connect(self.on_thumbnail_fetched)
                 self.fetchers.append(fetcher)
@@ -501,17 +505,16 @@ class MainWindow(QMainWindow):
         for i in range(self.list_widget.count()):
             item = self.list_widget.item(i)
             if item.data(Qt.UserRole) == link_id:
-                item.setIcon(QIcon(local_path))
+                pixmap = QPixmap(100, 75)
+                pixmap.fill(Qt.white)
+                item.setIcon(QIcon(pixmap))
                 break
         
-        # If the fetched thumbnail belongs to the currently selected link, update the preview
+        # If the fetched thumbnail belongs to the currently selected link, update the preview with a white shape
         if self.current_link_id == link_id:
-            pixmap = QPixmap(local_path)
-            if not pixmap.isNull():
-                self.thumbnail_preview.setPixmap(pixmap.scaled(self.thumbnail_preview.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation))
-            else:
-                self.thumbnail_preview.setText("")
-                self.thumbnail_preview.setPixmap(QPixmap())
+            pixmap = QPixmap(200, 150)
+            pixmap.fill(Qt.white)
+            self.thumbnail_preview.setPixmap(pixmap)
 
     def populate_tag_combo(self):
         current = self.tag_combo.currentText()
@@ -557,18 +560,10 @@ class MainWindow(QMainWindow):
                 pass
         self.stats_label.setText(f"Visits: {visits}  |  Last visited: {last}")
 
-        # Update thumbnail preview
-        local_path = os.path.join(THUMBNAILS_DIR, f"{link_id}.jpg")
-        if os.path.exists(local_path):
-            pixmap = QPixmap(local_path)
-            if not pixmap.isNull():
-                self.thumbnail_preview.setPixmap(pixmap.scaled(self.thumbnail_preview.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation))
-            else:
-                self.thumbnail_preview.setText("")
-                self.thumbnail_preview.setPixmap(QPixmap())
-        else:
-            self.thumbnail_preview.setText("")
-            self.thumbnail_preview.setPixmap(QPixmap())
+        # Update thumbnail preview to a white shape
+        pixmap = QPixmap(200, 150)
+        pixmap.fill(Qt.white)
+        self.thumbnail_preview.setPixmap(pixmap)
 
     # ---------- CRUD operations ----------
     def add_link_dialog(self):
