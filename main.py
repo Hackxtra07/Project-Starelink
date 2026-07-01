@@ -329,10 +329,10 @@ class MainWindow(QMainWindow):
 
         # Thumbnail Preview
         detail_layout.addWidget(QLabel("Thumbnail:"), 4, 0)
-        self.thumbnail_preview = QLabel("No thumbnail available")
+        self.thumbnail_preview = QLabel("")
         self.thumbnail_preview.setAlignment(Qt.AlignCenter)
         self.thumbnail_preview.setFixedSize(200, 150)
-        self.thumbnail_preview.setStyleSheet("border: 1px solid #ccc; background-color: #f0f0f0; color: #555; border-radius: 4px;")
+        self.thumbnail_preview.setStyleSheet("border: 1px solid #ccc; background-color: #ffffff; border-radius: 4px;")
         detail_layout.addWidget(self.thumbnail_preview, 4, 1)
 
         # Stats
@@ -510,7 +510,7 @@ class MainWindow(QMainWindow):
             if not pixmap.isNull():
                 self.thumbnail_preview.setPixmap(pixmap.scaled(self.thumbnail_preview.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation))
             else:
-                self.thumbnail_preview.setText("Corrupt thumbnail")
+                self.thumbnail_preview.setText("")
                 self.thumbnail_preview.setPixmap(QPixmap())
 
     def populate_tag_combo(self):
@@ -564,10 +564,10 @@ class MainWindow(QMainWindow):
             if not pixmap.isNull():
                 self.thumbnail_preview.setPixmap(pixmap.scaled(self.thumbnail_preview.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation))
             else:
-                self.thumbnail_preview.setText("Corrupt thumbnail")
+                self.thumbnail_preview.setText("")
                 self.thumbnail_preview.setPixmap(QPixmap())
         else:
-            self.thumbnail_preview.setText("No thumbnail available")
+            self.thumbnail_preview.setText("")
             self.thumbnail_preview.setPixmap(QPixmap())
 
     # ---------- CRUD operations ----------
@@ -623,7 +623,7 @@ class MainWindow(QMainWindow):
         self.tags_edit.clear()
         self.notes_edit.clear()
         self.stats_label.setText("")
-        self.thumbnail_preview.setText("No thumbnail available")
+        self.thumbnail_preview.setText("")
         self.thumbnail_preview.setPixmap(QPixmap())
 
     # ---------- Opening links ----------
