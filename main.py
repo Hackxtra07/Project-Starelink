@@ -702,6 +702,11 @@ class MainWindow(QMainWindow):
         save_page_btn.clicked.connect(self.save_current_page)
         browser_nav.addWidget(save_page_btn)
 
+        self.auto_save_checkbox = QCheckBox("Auto-Save xHamster Videos")
+        self.auto_save_checkbox.setStyleSheet("font-weight: bold; color: #ff0055;")
+        self.auto_save_checkbox.setToolTip("Automatically save visited xHamster video links, auto-fetching their thumbnail, tags, and cast.")
+        browser_nav.addWidget(self.auto_save_checkbox)
+
         
         browser_layout.addLayout(browser_nav)
 
@@ -1039,6 +1044,10 @@ class MainWindow(QMainWindow):
         web_view.urlChanged.connect(lambda qurl, view=web_view: self.update_url_bar(qurl, view))
         web_view.titleChanged.connect(lambda title, view=web_view: self.update_tab_title(title, view))
         
+        # Auto-save connections
+        web_view.urlChanged.connect(lambda qurl, view=web_view: self.check_and_auto_save(qurl, view))
+        web_view.titleChanged.connect(lambda title, view=web_view: self.check_and_update_title(title, view))
+        
         return web_view
 
     # ---------- Advanced Browser Features ----------
@@ -1105,6 +1114,54 @@ class MainWindow(QMainWindow):
         index = self.browser_tabs.indexOf(view)
         if index != -1:
             self.browser_tabs.setTabText(index, title)
+
+    def check_and_auto_save(self, qurl, view):
+        """Monitor URL visits and auto-save matching xHamster video URLs."""
+        if not hasattr(self, 'auto_save_checkbox') or not self.auto_save_checkbox.isChecked():
+            return
+        url = qurl.toString()
+        if 'xhamster.com/videos/' in url.lower():
+            # Check if this URL is already in the database
+            self.db.cursor.execute("SELECT id FROM links WHERE url = ?", (url,))
+            if self.db.cursor.fetchone() is None:
+                # Use tab/view title if loaded, otherwise slug
+                title = view.title().strip()
+                if not title or title.lower() in ("xhamster", "loading...", "about:blank"):
+                    match = re.search(r'/videos/([^/?#]+)', url)
+                    if match:
+                        title = match.group(1).replace('-', ' ').title()
+                    else:
+                        title = "xHamster Video"
+
+                # Save new link to DB
+                link_id = self.db.add_link(title, url, tags="", notes="", cast="")
+                self.refresh_list()
+
+                # Start background thumbnail fetcher
+                if not hasattr(self, 'fetchers'):
+                    self.fetchers = []
+                fetcher = ThumbnailFetcher(link_id, url)
+                fetcher.finished.connect(self.on_thumbnail_fetched)
+                self.fetchers.append(fetcher)
+                fetcher.start()
+
+                # Start background metadata fetcher (tags & cast)
+                self._start_metadata_fetcher(link_id, url)
+
+    def check_and_update_title(self, title, view):
+        """Update placeholder titles with the full title when loaded."""
+        if not hasattr(self, 'auto_save_checkbox') or not self.auto_save_checkbox.isChecked():
+            return
+        url = view.url().toString()
+        if 'xhamster.com/videos/' in url.lower():
+            self.db.cursor.execute("SELECT id, title FROM links WHERE url = ?", (url,))
+            row = self.db.cursor.fetchone()
+            if row:
+                link_id, old_title = row
+                if title.strip() and (old_title in ("xHamster Video", "") or "xhamster" in old_title.lower()):
+                    self.db.cursor.execute("UPDATE links SET title = ? WHERE id = ?", (title.strip(), link_id))
+                    self.db.conn.commit()
+                    self.refresh_list()
 
     def browser_back(self):
         current_view = self.browser_tabs.currentWidget()
