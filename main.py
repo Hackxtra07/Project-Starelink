@@ -285,9 +285,80 @@ class MetadataFetcher(QThread):
         self.link_id = link_id
         self.url = url
 
+    def _scrape_xhamster(self, html, url):
+        """xHamster-specific scraper: extracts tags and pornstar/model names."""
+        tags, cast = [], []
+
+        # ── JSON-LD (most reliable, xHamster includes schema.org/VideoObject) ──
+        for m in re.finditer(
+            r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
+            html, re.I | re.S
+        ):
+            try:
+                data = json.loads(m.group(1))
+                items = data if isinstance(data, list) else [data]
+                for item in items:
+                    # Tags from keywords
+                    kw = item.get('keywords', '')
+                    if isinstance(kw, str) and kw:
+                        for t in kw.split(','):
+                            t = t.strip()
+                            if t and t not in tags:
+                                tags.append(t)
+                    elif isinstance(kw, list):
+                        for t in kw:
+                            t = str(t).strip()
+                            if t and t not in tags:
+                                tags.append(t)
+                    # Cast from actor
+                    actors = item.get('actor', [])
+                    if isinstance(actors, dict):
+                        actors = [actors]
+                    for actor in actors:
+                        name = actor.get('name') if isinstance(actor, dict) else str(actor)
+                        if name and name not in cast:
+                            cast.append(name)
+            except Exception:
+                pass
+
+        # ── Tag links: /tags/xxx or /categories/xxx ──
+        if not tags:
+            for m in re.finditer(
+                r'href=["\'](?:https?://[^"\'/]*)?/(?:tags?|categories?)/[^"\'>]+["\'][^>]*>([^<]{1,60})</a>',
+                html, re.I
+            ):
+                val = m.group(1).strip()
+                if val and val.lower() not in ('next', 'prev', 'more', 'all') and val not in tags:
+                    tags.append(val)
+
+        # ── Pornstar / model links: /pornstars/xxx or /models/xxx ──
+        if not cast:
+            for m in re.finditer(
+                r'href=["\'](?:https?://[^"\'/]*)?/(?:pornstars?|models?)/[^"\'>]+["\'][^>]*>([^<]{1,80})</a>',
+                html, re.I
+            ):
+                name = m.group(1).strip()
+                if name and name not in cast:
+                    cast.append(name)
+
+        # ── Fallback: data-tag / data-model attributes ──
+        if not tags:
+            for m in re.finditer(r'data-(?:tag|category)=["\']([^"\']{1,60})["\']', html, re.I):
+                val = m.group(1).strip()
+                if val and val not in tags:
+                    tags.append(val)
+        if not cast:
+            for m in re.finditer(r'data-(?:model|pornstar)=["\']([^"\']{1,80})["\']', html, re.I):
+                val = m.group(1).strip()
+                if val and val not in cast:
+                    cast.append(val)
+
+        return tags[:15], cast[:10]
+
     def run(self):
         tags, cast = [], []
         url = self.url if self.url.startswith("http") else "http://" + self.url
+        is_xhamster = 'xhamster' in url.lower()
 
         # ── Strategy 1: yt-dlp (video sites) ──
         try:
@@ -297,7 +368,6 @@ class MetadataFetcher(QThread):
                 info = ydl.extract_info(url, download=False)
                 if info.get('tags'):
                     tags = [t.strip() for t in info['tags'] if t.strip()][:12]
-                # creator / artist / uploader
                 for key in ('artist', 'creator', 'uploader', 'channel'):
                     val = info.get(key, '')
                     if val and val not in cast:
@@ -324,7 +394,15 @@ class MetadataFetcher(QThread):
                 except Exception:
                     html = raw.decode('utf-8', errors='ignore')
 
-                # ─ Tags from meta keywords ─
+                # ── xHamster-specific parsing (priority) ──
+                if is_xhamster:
+                    xh_tags, xh_cast = self._scrape_xhamster(html, url)
+                    if xh_tags:
+                        tags = xh_tags
+                    if xh_cast:
+                        cast = xh_cast
+
+                # ── Generic: meta keywords ──
                 if not tags:
                     m = re.search(
                         r'<meta[^>]+name=["\']keywords["\'][^>]+content=["\']([^"\']{1,500})["\']',
@@ -336,7 +414,7 @@ class MetadataFetcher(QThread):
                     if m:
                         tags = [t.strip() for t in m.group(1).split(',') if t.strip()][:12]
 
-                # ─ Tags from article:tag / og:video:tag ─
+                # ── Generic: article:tag / og:video:tag ──
                 for pat in [
                     r'<meta[^>]+property=["\'](?:article|og):(?:tag|video:tag)["\'][^>]+content=["\']([^"\']+)["\']',
                     r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\'](?:article|og):(?:tag|video:tag)["\']',
@@ -346,7 +424,7 @@ class MetadataFetcher(QThread):
                         if val and val not in tags:
                             tags.append(val)
 
-                # ─ Cast from JSON-LD schema.org ─
+                # ── Generic: JSON-LD schema.org actor ──
                 if not cast:
                     for m in re.finditer(
                         r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
@@ -366,7 +444,7 @@ class MetadataFetcher(QThread):
                         except Exception:
                             pass
 
-                # ─ Cast from og:video:actor ─
+                # ── Generic: og:video:actor ──
                 if not cast:
                     for m in re.finditer(
                         r'<meta[^>]+property=["\']og:video:actor["\'][^>]+content=["\']([^"\']+)["\']',
@@ -493,22 +571,35 @@ class MainWindow(QMainWindow):
         self.cast_edit.setPlaceholderText("auto-extracted from URL")
         detail_layout.addWidget(self.cast_edit, 3, 1)
 
-        detail_layout.addWidget(QLabel("Notes:"), 4, 0)
+        # Fetch Tags & Cast button row
+        fetch_meta_layout = QHBoxLayout()
+        self.fetch_meta_btn = QPushButton("🔄 Fetch Tags & Cast")
+        self.fetch_meta_btn.setToolTip(
+            "Scrape tags and cast/models from the link URL.\n"
+            "Works for xHamster, YouTube, and most sites."
+        )
+        self.fetch_meta_btn.clicked.connect(self.fetch_tags_cast_now)
+        self.fetch_meta_btn.setStyleSheet("font-weight: bold; color: #0057b7;")
+        fetch_meta_layout.addWidget(self.fetch_meta_btn)
+        fetch_meta_layout.addStretch()
+        detail_layout.addLayout(fetch_meta_layout, 4, 0, 1, 2)
+
+        detail_layout.addWidget(QLabel("Notes:"), 5, 0)
         self.notes_edit = QTextEdit()
         self.notes_edit.setMaximumHeight(80)
-        detail_layout.addWidget(self.notes_edit, 4, 1)
+        detail_layout.addWidget(self.notes_edit, 5, 1)
 
         # Thumbnail Preview
-        detail_layout.addWidget(QLabel("Thumbnail:"), 5, 0)
+        detail_layout.addWidget(QLabel("Thumbnail:"), 6, 0)
         self.thumbnail_preview = QLabel("")
         self.thumbnail_preview.setAlignment(Qt.AlignCenter)
         self.thumbnail_preview.setFixedSize(200, 150)
         self.thumbnail_preview.setStyleSheet("border: 1px solid #ccc; background-color: #ffffff; border-radius: 4px;")
-        detail_layout.addWidget(self.thumbnail_preview, 5, 1)
+        detail_layout.addWidget(self.thumbnail_preview, 6, 1)
 
         # Stats
         self.stats_label = QLabel("")
-        detail_layout.addWidget(self.stats_label, 6, 0, 1, 2)
+        detail_layout.addWidget(self.stats_label, 7, 0, 1, 2)
 
         # Buttons
         btn_layout = QHBoxLayout()
@@ -529,7 +620,7 @@ class MainWindow(QMainWindow):
         self.download_link_btn.clicked.connect(self.download_selected_link)
         self.download_link_btn.setStyleSheet("font-weight: bold;")
         btn_layout.addWidget(self.download_link_btn)
-        detail_layout.addLayout(btn_layout, 7, 0, 1, 2)
+        detail_layout.addLayout(btn_layout, 8, 0, 1, 2)
 
         # Import/Export buttons
         imp_exp_layout = QHBoxLayout()
@@ -542,7 +633,7 @@ class MainWindow(QMainWindow):
         export_btn = QPushButton("📤 Export JSON")
         export_btn.clicked.connect(self.export_json)
         imp_exp_layout.addWidget(export_btn)
-        detail_layout.addLayout(imp_exp_layout, 8, 0, 1, 2)
+        detail_layout.addLayout(imp_exp_layout, 9, 0, 1, 2)
 
         splitter.addWidget(detail_widget)
         splitter.setSizes([400, 800])
@@ -752,6 +843,50 @@ class MainWindow(QMainWindow):
         self.clear_details()
         # Kick off background metadata extraction
         self._start_metadata_fetcher(link_id, url.strip())
+
+    def fetch_tags_cast_now(self):
+        """Manually trigger background scraping for the selected link."""
+        if self.current_link_id is None:
+            QMessageBox.warning(self, "Warning", "No link selected.")
+            return
+        url = self.url_edit.text().strip()
+        if not url:
+            QMessageBox.warning(self, "Warning", "URL is empty.")
+            return
+        self.fetch_meta_btn.setEnabled(False)
+        self.fetch_meta_btn.setText("🔄 Fetching...")
+
+        if not hasattr(self, 'meta_fetchers'):
+            self.meta_fetchers = []
+        self.meta_fetchers = [f for f in self.meta_fetchers if f.isRunning()]
+
+        mf = MetadataFetcher(self.current_link_id, url)
+
+        def on_manual_fetched(link_id, tags, cast):
+            self.fetch_meta_btn.setEnabled(True)
+            self.fetch_meta_btn.setText("🔄 Fetch Tags & Cast")
+            if link_id == self.current_link_id:
+                if tags:
+                    self.tags_edit.setText(tags)
+                if cast:
+                    self.cast_edit.setText(cast)
+                # Auto save changes to the DB too
+                self.db.update_link(
+                    link_id,
+                    self.title_edit.text().strip(),
+                    self.url_edit.text().strip(),
+                    self.tags_edit.text().strip(),
+                    self.notes_edit.toPlainText().strip(),
+                    self.cast_edit.text().strip()
+                )
+                QMessageBox.information(self, "Success", f"Metadata extracted successfully!\n\nTags: {tags}\nCast: {cast}")
+            else:
+                self.db.update_metadata(link_id, tags, cast)
+            self.refresh_list()
+
+        mf.metadata_ready.connect(on_manual_fetched)
+        self.meta_fetchers.append(mf)
+        mf.start()
 
     def _start_metadata_fetcher(self, link_id, url):
         """Launch a MetadataFetcher for the given link in the background."""
