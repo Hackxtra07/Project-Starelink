@@ -122,13 +122,26 @@ class LinkManager:
         self.cursor.execute("DELETE FROM links WHERE id=?", (link_id,))
         self.conn.commit()
 
-    def get_all_links(self, search_term="", tag_filter=""):
+    def get_all_links(self, search_term="", tag_filter="", search_field="All Fields"):
         query = "SELECT * FROM links WHERE 1=1"
         params = []
         if search_term:
-            query += " AND (title LIKE ? OR url LIKE ? OR tags LIKE ? OR cast LIKE ?)"
             like = f"%{search_term}%"
-            params.extend([like, like, like, like])
+            if search_field == "Title":
+                query += " AND title LIKE ?"
+                params.append(like)
+            elif search_field == "URL":
+                query += " AND url LIKE ?"
+                params.append(like)
+            elif search_field == "Tags":
+                query += " AND tags LIKE ?"
+                params.append(like)
+            elif search_field == "Cast":
+                query += " AND cast LIKE ?"
+                params.append(like)
+            else: # All Fields
+                query += " AND (title LIKE ? OR url LIKE ? OR tags LIKE ? OR cast LIKE ?)"
+                params.extend([like, like, like, like])
         if tag_filter:
             query += " AND tags LIKE ?"
             params.append(f"%{tag_filter}%")
@@ -517,8 +530,14 @@ class MainWindow(QMainWindow):
         self.search_input = QLineEdit()
         self.search_input.setPlaceholderText("Search links...")
         self.search_input.textChanged.connect(self.on_search_changed)
+
+        self.search_field_combo = QComboBox()
+        self.search_field_combo.addItems(["All Fields", "Title", "URL", "Tags", "Cast"])
+        self.search_field_combo.currentTextChanged.connect(lambda: self.refresh_list())
+
         controls.addWidget(QLabel("Search:"))
         controls.addWidget(self.search_input)
+        controls.addWidget(self.search_field_combo)
 
         self.tag_combo = QComboBox()
         self.tag_combo.addItem("All Tags")
@@ -743,7 +762,8 @@ class MainWindow(QMainWindow):
     def refresh_list(self):
         """Refresh the link list based on current search/tag filter."""
         self.list_widget.clear()
-        links = self.db.get_all_links(self.current_search, self.current_tag_filter)
+        search_field = self.search_field_combo.currentText() if hasattr(self, 'search_field_combo') else "All Fields"
+        links = self.db.get_all_links(self.current_search, self.current_tag_filter, search_field)
         # NOTE: keep fetchers on self so threads are never GC'd mid-download
         if not hasattr(self, 'fetchers'):
             self.fetchers = []
