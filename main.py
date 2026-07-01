@@ -27,27 +27,35 @@ from downloader import DownloaderWidget
 
 try:
     from PIL import Image as PILImage
+    import io as _io
     _PIL_AVAILABLE = True
 except ImportError:
     _PIL_AVAILABLE = False
 
 
 def load_pixmap(path, width=200, height=150):
-    """Load an image using Pillow and return a QPixmap.
-    Falls back to a blank white QPixmap if loading fails."""
+    """Load an image via Pillow → in-memory PNG → QPixmap.
+    Qt's PNG decoder is built-in (no plugin needed), so this is
+    reliable even when the JPEG Qt plugin is missing.
+    Falls back to a plain white QPixmap on any error."""
     if _PIL_AVAILABLE and os.path.exists(path):
         try:
-            img = PILImage.open(path).convert("RGBA")
+            img = PILImage.open(path).convert("RGB")
             img = img.resize((width, height), PILImage.LANCZOS)
-            data = img.tobytes("raw", "RGBA")
-            qimg = QImage(data, width, height, QImage.Format_RGBA8888)
-            return QPixmap.fromImage(qimg)
-        except Exception:
-            pass
-    # Fallback: solid white shape
+            buf = _io.BytesIO()
+            img.save(buf, format="PNG")
+            px = QPixmap()
+            px.loadFromData(buf.getvalue(), "PNG")
+            if not px.isNull():
+                return px
+        except Exception as _e:
+            print(f"[load_pixmap] {path}: {_e}")
+    # Fallback: solid white placeholder
     px = QPixmap(width, height)
     px.fill(Qt.white)
     return px
+
+
 TABLE_SCHEMA = """
 CREATE TABLE IF NOT EXISTS links (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -495,20 +503,24 @@ class MainWindow(QMainWindow):
         """Refresh the link list based on current search/tag filter."""
         self.list_widget.clear()
         links = self.db.get_all_links(self.current_search, self.current_tag_filter)
-        self.fetchers = getattr(self, 'fetchers', [])
-        
+        # NOTE: keep fetchers on self so threads are never GC'd mid-download
+        if not hasattr(self, 'fetchers'):
+            self.fetchers = []
+        # Remove finished threads to avoid unbounded growth
+        self.fetchers = [f for f in self.fetchers if f.isRunning()]
+
         for link in links:
             item = QListWidgetItem(f"{link[1]}")  # title
             item.setData(Qt.UserRole, link[0])   # store id
-            # Show tags as subtitle
             if link[3]:
                 item.setToolTip(f"Tags: {link[3]}")
-            
+
             local_path = os.path.join(THUMBNAILS_DIR, f"{link[0]}.jpg")
             if os.path.exists(local_path):
+                # Thumbnail already on disk — display it immediately
                 item.setIcon(QIcon(load_pixmap(local_path, 100, 75)))
             else:
-                # Show white placeholder until thumbnail is downloaded
+                # Show white placeholder and kick off background download
                 px = QPixmap(100, 75)
                 px.fill(Qt.white)
                 item.setIcon(QIcon(px))
@@ -516,7 +528,7 @@ class MainWindow(QMainWindow):
                 fetcher.finished.connect(self.on_thumbnail_fetched)
                 self.fetchers.append(fetcher)
                 fetcher.start()
-                
+
             self.list_widget.addItem(item)
         # Update tag combo
         self.populate_tag_combo()
