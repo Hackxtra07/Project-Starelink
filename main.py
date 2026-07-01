@@ -65,7 +65,8 @@ CREATE TABLE IF NOT EXISTS links (
     notes TEXT,
     visit_count INTEGER DEFAULT 0,
     last_visited DATETIME,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    cast TEXT
 )
 """
 
@@ -79,21 +80,41 @@ class LinkManager:
 
     def _init_db(self):
         self.cursor.execute(TABLE_SCHEMA)
+        # Safe migration: add cast column if it doesn't exist yet
+        try:
+            self.cursor.execute("ALTER TABLE links ADD COLUMN cast TEXT")
+        except sqlite3.OperationalError:
+            pass  # Column already exists
         self.conn.commit()
 
-    def add_link(self, title, url, tags="", notes=""):
+    def add_link(self, title, url, tags="", notes="", cast=""):
         self.cursor.execute(
-            "INSERT INTO links (title, url, tags, notes) VALUES (?, ?, ?, ?)",
-            (title, url, tags, notes)
+            "INSERT INTO links (title, url, tags, notes, cast) VALUES (?, ?, ?, ?, ?)",
+            (title, url, tags, notes, cast)
         )
         self.conn.commit()
         return self.cursor.lastrowid
 
-    def update_link(self, link_id, title, url, tags, notes):
+    def update_link(self, link_id, title, url, tags, notes, cast=""):
         self.cursor.execute(
-            """UPDATE links SET title=?, url=?, tags=?, notes=?
+            """UPDATE links SET title=?, url=?, tags=?, notes=?, cast=?
                WHERE id=?""",
-            (title, url, tags, notes, link_id)
+            (title, url, tags, notes, cast, link_id)
+        )
+        self.conn.commit()
+
+    def update_metadata(self, link_id, tags, cast):
+        """Silently update tags and cast extracted in the background."""
+        # Only fill in fields that are currently empty
+        self.cursor.execute("SELECT tags, cast FROM links WHERE id=?", (link_id,))
+        row = self.cursor.fetchone()
+        if not row:
+            return
+        new_tags = row[0] if row[0] else tags
+        new_cast = row[1] if row[1] else cast
+        self.cursor.execute(
+            "UPDATE links SET tags=?, cast=? WHERE id=?",
+            (new_tags, new_cast, link_id)
         )
         self.conn.commit()
 
@@ -105,9 +126,9 @@ class LinkManager:
         query = "SELECT * FROM links WHERE 1=1"
         params = []
         if search_term:
-            query += " AND (title LIKE ? OR url LIKE ? OR tags LIKE ?)"
+            query += " AND (title LIKE ? OR url LIKE ? OR tags LIKE ? OR cast LIKE ?)"
             like = f"%{search_term}%"
-            params.extend([like, like, like])
+            params.extend([like, like, like, like])
         if tag_filter:
             query += " AND tags LIKE ?"
             params.append(f"%{tag_filter}%")
@@ -249,6 +270,122 @@ class ThumbnailFetcher(QThread):
 
 
 
+class MetadataFetcher(QThread):
+    """Background thread: extracts tags and cast/actor names from a URL.
+    Uses yt-dlp for video sites and HTML scraping for everything else."""
+    metadata_ready = pyqtSignal(int, str, str)  # link_id, tags_csv, cast_csv
+
+    USER_AGENT = (
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+    )
+
+    def __init__(self, link_id, url):
+        super().__init__()
+        self.link_id = link_id
+        self.url = url
+
+    def run(self):
+        tags, cast = [], []
+        url = self.url if self.url.startswith("http") else "http://" + self.url
+
+        # ── Strategy 1: yt-dlp (video sites) ──
+        try:
+            import yt_dlp
+            with yt_dlp.YoutubeDL({'quiet': True, 'no_warnings': True,
+                                    'skip_download': True}) as ydl:
+                info = ydl.extract_info(url, download=False)
+                if info.get('tags'):
+                    tags = [t.strip() for t in info['tags'] if t.strip()][:12]
+                # creator / artist / uploader
+                for key in ('artist', 'creator', 'uploader', 'channel'):
+                    val = info.get(key, '')
+                    if val and val not in cast:
+                        cast.append(val)
+        except Exception:
+            pass
+
+        # ── Strategy 2: HTML scraping ──
+        if not tags or not cast:
+            try:
+                import gzip
+                headers = {
+                    'User-Agent': self.USER_AGENT,
+                    'Accept': 'text/html,application/xhtml+xml,*/*;q=0.8',
+                    'Accept-Language': 'en-US,en;q=0.9',
+                    'Accept-Encoding': 'gzip, deflate',
+                    'Connection': 'keep-alive',
+                }
+                req = urllib.request.Request(url, headers=headers)
+                with urllib.request.urlopen(req, timeout=10) as resp:
+                    raw = resp.read()
+                try:
+                    html = gzip.decompress(raw).decode('utf-8', errors='ignore')
+                except Exception:
+                    html = raw.decode('utf-8', errors='ignore')
+
+                # ─ Tags from meta keywords ─
+                if not tags:
+                    m = re.search(
+                        r'<meta[^>]+name=["\']keywords["\'][^>]+content=["\']([^"\']{1,500})["\']',
+                        html, re.I)
+                    if not m:
+                        m = re.search(
+                            r'<meta[^>]+content=["\']([^"\']{1,500})["\'][^>]+name=["\']keywords["\']',
+                            html, re.I)
+                    if m:
+                        tags = [t.strip() for t in m.group(1).split(',') if t.strip()][:12]
+
+                # ─ Tags from article:tag / og:video:tag ─
+                for pat in [
+                    r'<meta[^>]+property=["\'](?:article|og):(?:tag|video:tag)["\'][^>]+content=["\']([^"\']+)["\']',
+                    r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\'](?:article|og):(?:tag|video:tag)["\']',
+                ]:
+                    for m in re.finditer(pat, html, re.I):
+                        val = m.group(1).strip()
+                        if val and val not in tags:
+                            tags.append(val)
+
+                # ─ Cast from JSON-LD schema.org ─
+                if not cast:
+                    for m in re.finditer(
+                        r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
+                        html, re.I | re.S
+                    ):
+                        try:
+                            data = json.loads(m.group(1))
+                            items = data if isinstance(data, list) else [data]
+                            for item in items:
+                                actors = item.get('actor', [])
+                                if isinstance(actors, dict):
+                                    actors = [actors]
+                                for actor in actors:
+                                    name = actor.get('name') if isinstance(actor, dict) else str(actor)
+                                    if name and name not in cast:
+                                        cast.append(name)
+                        except Exception:
+                            pass
+
+                # ─ Cast from og:video:actor ─
+                if not cast:
+                    for m in re.finditer(
+                        r'<meta[^>]+property=["\']og:video:actor["\'][^>]+content=["\']([^"\']+)["\']',
+                        html, re.I
+                    ):
+                        val = m.group(1).strip()
+                        if val and val not in cast:
+                            cast.append(val)
+
+            except Exception as e:
+                print(f"[MetadataFetcher] HTML scraping failed for {url}: {e}")
+
+        self.metadata_ready.emit(
+            self.link_id,
+            ", ".join(tags[:12]),
+            ", ".join(cast[:8])
+        )
+
+
 class CustomWebEngineView(QWebEngineView):
     def __init__(self, main_window, parent=None):
         super().__init__(parent)
@@ -346,26 +483,32 @@ class MainWindow(QMainWindow):
         self.url_edit = QLineEdit()
         detail_layout.addWidget(self.url_edit, 1, 1)
 
-        detail_layout.addWidget(QLabel("Tags (comma separated):"), 2, 0)
+        detail_layout.addWidget(QLabel("Tags:"), 2, 0)
         self.tags_edit = QLineEdit()
+        self.tags_edit.setPlaceholderText("comma separated — auto-filled from URL")
         detail_layout.addWidget(self.tags_edit, 2, 1)
 
-        detail_layout.addWidget(QLabel("Notes:"), 3, 0)
+        detail_layout.addWidget(QLabel("Cast / Creator:"), 3, 0)
+        self.cast_edit = QLineEdit()
+        self.cast_edit.setPlaceholderText("auto-extracted from URL")
+        detail_layout.addWidget(self.cast_edit, 3, 1)
+
+        detail_layout.addWidget(QLabel("Notes:"), 4, 0)
         self.notes_edit = QTextEdit()
-        self.notes_edit.setMaximumHeight(100)
-        detail_layout.addWidget(self.notes_edit, 3, 1)
+        self.notes_edit.setMaximumHeight(80)
+        detail_layout.addWidget(self.notes_edit, 4, 1)
 
         # Thumbnail Preview
-        detail_layout.addWidget(QLabel("Thumbnail:"), 4, 0)
+        detail_layout.addWidget(QLabel("Thumbnail:"), 5, 0)
         self.thumbnail_preview = QLabel("")
         self.thumbnail_preview.setAlignment(Qt.AlignCenter)
         self.thumbnail_preview.setFixedSize(200, 150)
         self.thumbnail_preview.setStyleSheet("border: 1px solid #ccc; background-color: #ffffff; border-radius: 4px;")
-        detail_layout.addWidget(self.thumbnail_preview, 4, 1)
+        detail_layout.addWidget(self.thumbnail_preview, 5, 1)
 
         # Stats
         self.stats_label = QLabel("")
-        detail_layout.addWidget(self.stats_label, 5, 0, 1, 2)
+        detail_layout.addWidget(self.stats_label, 6, 0, 1, 2)
 
         # Buttons
         btn_layout = QHBoxLayout()
@@ -386,8 +529,7 @@ class MainWindow(QMainWindow):
         self.download_link_btn.clicked.connect(self.download_selected_link)
         self.download_link_btn.setStyleSheet("font-weight: bold;")
         btn_layout.addWidget(self.download_link_btn)
-        detail_layout.addLayout(btn_layout, 6, 0, 1, 2)
-
+        detail_layout.addLayout(btn_layout, 7, 0, 1, 2)
 
         # Import/Export buttons
         imp_exp_layout = QHBoxLayout()
@@ -400,7 +542,7 @@ class MainWindow(QMainWindow):
         export_btn = QPushButton("📤 Export JSON")
         export_btn.clicked.connect(self.export_json)
         imp_exp_layout.addWidget(export_btn)
-        detail_layout.addLayout(imp_exp_layout, 7, 0, 1, 2)
+        detail_layout.addLayout(imp_exp_layout, 8, 0, 1, 2)
 
         splitter.addWidget(detail_widget)
         splitter.setSizes([400, 800])
@@ -587,6 +729,8 @@ class MainWindow(QMainWindow):
             except:
                 pass
         self.stats_label.setText(f"Visits: {visits}  |  Last visited: {last}")
+        # Cast (column index 10, added after created_at)
+        self.cast_edit.setText(link[10] or "" if len(link) > 10 else "")
 
         # Update thumbnail preview using Pillow-based loader
         local_path = os.path.join(THUMBNAILS_DIR, f"{link_id}.jpg")
@@ -600,12 +744,35 @@ class MainWindow(QMainWindow):
         url, ok2 = QInputDialog.getText(self, "Add Link", "URL:")
         if not ok2 or not url.strip():
             return
-        tags, ok3 = QInputDialog.getText(self, "Add Link", "Tags (comma separated):")
+        tags, ok3 = QInputDialog.getText(self, "Add Link", "Tags (comma separated, or leave blank to auto-extract):")
         if not ok3:
             tags = ""
-        self.db.add_link(title.strip(), url.strip(), tags.strip())
+        link_id = self.db.add_link(title.strip(), url.strip(), tags.strip())
         self.refresh_list()
         self.clear_details()
+        # Kick off background metadata extraction
+        self._start_metadata_fetcher(link_id, url.strip())
+
+    def _start_metadata_fetcher(self, link_id, url):
+        """Launch a MetadataFetcher for the given link in the background."""
+        if not hasattr(self, 'meta_fetchers'):
+            self.meta_fetchers = []
+        self.meta_fetchers = [f for f in self.meta_fetchers if f.isRunning()]
+        mf = MetadataFetcher(link_id, url)
+        mf.metadata_ready.connect(self.on_metadata_fetched)
+        self.meta_fetchers.append(mf)
+        mf.start()
+
+    def on_metadata_fetched(self, link_id, tags, cast):
+        """Called when MetadataFetcher finishes. Updates DB and refreshes UI."""
+        self.db.update_metadata(link_id, tags, cast)
+        # If the link is currently selected, refresh the fields live
+        if self.current_link_id == link_id:
+            if tags and not self.tags_edit.text().strip():
+                self.tags_edit.setText(tags)
+            if cast and not self.cast_edit.text().strip():
+                self.cast_edit.setText(cast)
+        self.refresh_list()
 
     def save_link(self):
         if self.current_link_id is None:
@@ -618,7 +785,8 @@ class MainWindow(QMainWindow):
             return
         tags = self.tags_edit.text().strip()
         notes = self.notes_edit.toPlainText().strip()
-        self.db.update_link(self.current_link_id, title, url, tags, notes)
+        cast = self.cast_edit.text().strip()
+        self.db.update_link(self.current_link_id, title, url, tags, notes, cast)
         self.refresh_list()
         # Update the selected item text
         for i in range(self.list_widget.count()):
@@ -643,6 +811,7 @@ class MainWindow(QMainWindow):
         self.title_edit.clear()
         self.url_edit.clear()
         self.tags_edit.clear()
+        self.cast_edit.clear()
         self.notes_edit.clear()
         self.stats_label.setText("")
         self.thumbnail_preview.setText("")
