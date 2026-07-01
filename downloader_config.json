@@ -1,0 +1,25 @@
+{
+    "download_path": "/home/kali/Documents/.top_tech",
+    "max_concurrent": 3,
+    "auto_open_folder": false,
+    "show_notifications": true,
+    "default_format": "best",
+    "embed_thumbnail": true,
+    "embed_subtitles": false,
+    "subtitles_langs": [
+        "en"
+    ],
+    "extract_audio": false,
+    "audio_format": "mp3",
+    "audio_quality": "192",
+    "limit_speed": false,
+    "speed_limit": "0",
+    "proxy": "",
+    "cookies_file": "",
+    "auto_number": true,
+    "output_template": "%(title)s.%(ext)s",
+    "playlist_start": 1,
+    "playlist_end": null,
+    "retry_count": 3,
+    "timeout": 30
+}

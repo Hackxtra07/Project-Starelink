@@ -1,0 +1,4 @@
+thumbnails/
+__pycache__/
+*.db
+download_history.json
