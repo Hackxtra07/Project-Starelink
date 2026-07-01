@@ -23,6 +23,7 @@ from PyQt5.QtCore import Qt, QUrl, QDateTime, QThread, pyqtSignal, QSize
 from PyQt5.QtGui import QIcon, QFont, QKeySequence, QPixmap, QImage
 
 from PyQt5.QtWebEngineWidgets import QWebEngineView, QWebEngineProfile, QWebEngineSettings, QWebEnginePage, QWebEngineDownloadItem
+from PyQt5.QtNetwork import QNetworkProxy
 from downloader import DownloaderWidget
 
 try:
@@ -54,6 +55,27 @@ def load_pixmap(path, width=200, height=150):
     px = QPixmap(width, height)
     px.fill(Qt.white)
     return px
+
+
+def clean_title_from_url(url):
+    """Extract a clean human-readable title from a URL.
+    Strips protocol, domain, path prefixes, and trailing numeric IDs."""
+    try:
+        parsed = urllib.parse.urlparse(url)
+        path = parsed.path.rstrip('/')
+        segments = [p for p in path.split('/') if p]
+        if not segments:
+            return url
+        segment = segments[-1]
+        # Remove trailing numeric IDs (e.g. video-title-123456)
+        segment = re.sub(r'[-_]\d{4,}$', '', segment)
+        # Replace hyphens and underscores with spaces
+        segment = segment.replace('-', ' ').replace('_', ' ')
+        # Title-case the result
+        title = segment.strip().title()
+        return title if title else url
+    except Exception:
+        return url
 
 
 TABLE_SCHEMA = """
@@ -89,7 +111,7 @@ class LinkManager:
 
     def add_link(self, title, url, tags="", notes="", cast=""):
         self.cursor.execute(
-            "INSERT INTO links (title, url, tags, notes, cast) VALUES (?, ?, ?, ?, ?)",
+            'INSERT INTO links (title, url, tags, notes, "cast") VALUES (?, ?, ?, ?, ?)',
             (title, url, tags, notes, cast)
         )
         self.conn.commit()
@@ -97,23 +119,21 @@ class LinkManager:
 
     def update_link(self, link_id, title, url, tags, notes, cast=""):
         self.cursor.execute(
-            """UPDATE links SET title=?, url=?, tags=?, notes=?, cast=?
-               WHERE id=?""",
+            'UPDATE links SET title=?, url=?, tags=?, notes=?, "cast"=? WHERE id=?',
             (title, url, tags, notes, cast, link_id)
         )
         self.conn.commit()
 
     def update_metadata(self, link_id, tags, cast):
         """Silently update tags and cast extracted in the background."""
-        # Only fill in fields that are currently empty
-        self.cursor.execute("SELECT tags, cast FROM links WHERE id=?", (link_id,))
+        self.cursor.execute('SELECT tags, "cast" FROM links WHERE id=?', (link_id,))
         row = self.cursor.fetchone()
         if not row:
             return
         new_tags = row[0] if row[0] else tags
         new_cast = row[1] if row[1] else cast
         self.cursor.execute(
-            "UPDATE links SET tags=?, cast=? WHERE id=?",
+            'UPDATE links SET tags=?, "cast"=? WHERE id=?',
             (new_tags, new_cast, link_id)
         )
         self.conn.commit()
@@ -137,10 +157,10 @@ class LinkManager:
                 query += " AND tags LIKE ?"
                 params.append(like)
             elif search_field == "Cast":
-                query += " AND cast LIKE ?"
+                query += ' AND "cast" LIKE ?'
                 params.append(like)
-            else: # All Fields
-                query += " AND (title LIKE ? OR url LIKE ? OR tags LIKE ? OR cast LIKE ?)"
+            else:  # All Fields
+                query += ' AND (title LIKE ? OR url LIKE ? OR tags LIKE ? OR "cast" LIKE ?)'
                 params.extend([like, like, like, like])
         if tag_filter:
             query += " AND tags LIKE ?"
@@ -555,6 +575,11 @@ class MainWindow(QMainWindow):
         dedup_btn.clicked.connect(self.remove_duplicate_links)
         controls.addWidget(dedup_btn)
 
+        fetch_all_btn = QPushButton("🔄 Fetch All Metadata")
+        fetch_all_btn.setToolTip("Auto-fetch tags & cast for all links missing metadata (runs in background)")
+        fetch_all_btn.clicked.connect(self.fetch_all_metadata)
+        controls.addWidget(fetch_all_btn)
+
 
         self.manager_layout.addLayout(controls)
 
@@ -707,6 +732,11 @@ class MainWindow(QMainWindow):
         self.auto_save_checkbox.setToolTip("Automatically save visited xHamster video links, auto-fetching their thumbnail, tags, and cast.")
         browser_nav.addWidget(self.auto_save_checkbox)
 
+        proxy_btn = QPushButton("⚙️ Proxy")
+        proxy_btn.setToolTip("Configure HTTP proxy for the browser")
+        proxy_btn.clicked.connect(self.open_proxy_settings)
+        browser_nav.addWidget(proxy_btn)
+
         
         browser_layout.addLayout(browser_nav)
 
@@ -854,7 +884,8 @@ class MainWindow(QMainWindow):
                 pass
         self.stats_label.setText(f"Visits: {visits}  |  Last visited: {last}")
         # Cast (column index 10, added after created_at)
-        self.cast_edit.setText(link[10] or "" if len(link) > 10 else "")
+        # Cast is at column index 8 (added via ALTER TABLE after created_at)
+        self.cast_edit.setText(link[8] or "" if len(link) > 8 else "")
 
         # Update thumbnail preview using Pillow-based loader
         local_path = os.path.join(THUMBNAILS_DIR, f"{link_id}.jpg")
@@ -1121,35 +1152,23 @@ class MainWindow(QMainWindow):
             return
         url = qurl.toString()
         if 'xhamster.com/videos/' in url.lower():
-            # Check if this URL is already in the database
             self.db.cursor.execute("SELECT id FROM links WHERE url = ?", (url,))
             if self.db.cursor.fetchone() is None:
-                # Use tab/view title if loaded, otherwise slug
-                title = view.title().strip()
-                if not title or title.lower() in ("xhamster", "loading...", "about:blank"):
-                    match = re.search(r'/videos/([^/?#]+)', url)
-                    if match:
-                        title = match.group(1).replace('-', ' ').title()
-                    else:
-                        title = "xHamster Video"
-
-                # Save new link to DB
+                # Build a clean title from the URL slug
+                title = clean_title_from_url(url)
                 link_id = self.db.add_link(title, url, tags="", notes="", cast="")
                 self.refresh_list()
 
-                # Start background thumbnail fetcher
                 if not hasattr(self, 'fetchers'):
                     self.fetchers = []
                 fetcher = ThumbnailFetcher(link_id, url)
                 fetcher.finished.connect(self.on_thumbnail_fetched)
                 self.fetchers.append(fetcher)
                 fetcher.start()
-
-                # Start background metadata fetcher (tags & cast)
                 self._start_metadata_fetcher(link_id, url)
 
     def check_and_update_title(self, title, view):
-        """Update placeholder titles with the full title when loaded."""
+        """Update placeholder titles with the real page title when loaded."""
         if not hasattr(self, 'auto_save_checkbox') or not self.auto_save_checkbox.isChecked():
             return
         url = view.url().toString()
@@ -1158,10 +1177,70 @@ class MainWindow(QMainWindow):
             row = self.db.cursor.fetchone()
             if row:
                 link_id, old_title = row
-                if title.strip() and (old_title in ("xHamster Video", "") or "xhamster" in old_title.lower()):
-                    self.db.cursor.execute("UPDATE links SET title = ? WHERE id = ?", (title.strip(), link_id))
+                # Only overwrite auto-generated slug titles
+                clean_title = title.strip()
+                # Strip xHamster suffix like " - XNXX.COM" / " | xHamster"
+                clean_title = re.sub(r'\s*[|\-–]\s*(xhamster|xnxx|porn)[^$]*$', '', clean_title, flags=re.I).strip()
+                if clean_title and clean_title.lower() != old_title.lower():
+                    self.db.cursor.execute("UPDATE links SET title = ? WHERE id = ?", (clean_title, link_id))
                     self.db.conn.commit()
                     self.refresh_list()
+
+    def open_proxy_settings(self):
+        """Open a dialog to configure HTTP proxy for the browser."""
+        current = QNetworkProxy.applicationProxy()
+        if current.type() == QNetworkProxy.NoProxy:
+            current_str = ""
+        else:
+            current_str = f"{current.hostName()}:{current.port()}"
+
+        proxy_str, ok = QInputDialog.getText(
+            self, "Proxy Settings",
+            "Enter HTTP proxy as  host:port  (leave blank to disable):\n"
+            "Example:  127.0.0.1:8080",
+            text=current_str
+        )
+        if not ok:
+            return
+        proxy_str = proxy_str.strip()
+        if not proxy_str:
+            QNetworkProxy.setApplicationProxy(QNetworkProxy(QNetworkProxy.NoProxy))
+            QMessageBox.information(self, "Proxy", "Proxy disabled — browsing directly.")
+        else:
+            parts = proxy_str.rsplit(":", 1)
+            if len(parts) != 2:
+                QMessageBox.warning(self, "Proxy Error", "Use the format  host:port")
+                return
+            try:
+                host = parts[0].strip()
+                port = int(parts[1].strip())
+                proxy = QNetworkProxy(QNetworkProxy.HttpProxy, host, port)
+                QNetworkProxy.setApplicationProxy(proxy)
+                QMessageBox.information(self, "Proxy", f"Proxy set to {host}:{port}")
+            except ValueError:
+                QMessageBox.warning(self, "Proxy Error", "Port must be a number.")
+
+    def fetch_all_metadata(self):
+        """Fetch tags & cast for every link that is missing them."""
+        all_links = self.db.get_all_links()
+        # Links where tags OR cast column is empty/None
+        missing = [(l[0], l[2]) for l in all_links if not (l[3] or "").strip() or not (l[8] or "").strip()]
+        if not missing:
+            QMessageBox.information(self, "Fetch All Metadata",
+                "All links already have tags and cast!")
+            return
+        reply = QMessageBox.question(
+            self, "Fetch All Metadata",
+            f"Fetch tags & cast for {len(missing)} link(s) with missing metadata?\n"
+            "This runs in the background — the fields will update automatically.",
+            QMessageBox.Yes | QMessageBox.No
+        )
+        if reply == QMessageBox.Yes:
+            for link_id, url in missing:
+                self._start_metadata_fetcher(link_id, url)
+            QMessageBox.information(self, "Fetch All Metadata",
+                f"Started background fetch for {len(missing)} link(s).\n"
+                "Tags and cast fields will fill in automatically as results arrive.")
 
     def browser_back(self):
         current_view = self.browser_tabs.currentWidget()
