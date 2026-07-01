@@ -20,14 +20,34 @@ from PyQt5.QtWidgets import (
     QTabWidget, QMenu, QAction, QGridLayout, QCheckBox, QShortcut
 )
 from PyQt5.QtCore import Qt, QUrl, QDateTime, QThread, pyqtSignal, QSize
-from PyQt5.QtGui import QIcon, QFont, QKeySequence, QPixmap
+from PyQt5.QtGui import QIcon, QFont, QKeySequence, QPixmap, QImage
 
 from PyQt5.QtWebEngineWidgets import QWebEngineView, QWebEngineProfile, QWebEngineSettings, QWebEnginePage, QWebEngineDownloadItem
 from downloader import DownloaderWidget
 
+try:
+    from PIL import Image as PILImage
+    _PIL_AVAILABLE = True
+except ImportError:
+    _PIL_AVAILABLE = False
 
 
-DB_NAME = os.path.join(SCRIPT_DIR, "links.db")
+def load_pixmap(path, width=200, height=150):
+    """Load an image using Pillow and return a QPixmap.
+    Falls back to a blank white QPixmap if loading fails."""
+    if _PIL_AVAILABLE and os.path.exists(path):
+        try:
+            img = PILImage.open(path).convert("RGBA")
+            img = img.resize((width, height), PILImage.LANCZOS)
+            data = img.tobytes("raw", "RGBA")
+            qimg = QImage(data, width, height, QImage.Format_RGBA8888)
+            return QPixmap.fromImage(qimg)
+        except Exception:
+            pass
+    # Fallback: solid white shape
+    px = QPixmap(width, height)
+    px.fill(Qt.white)
+    return px
 TABLE_SCHEMA = """
 CREATE TABLE IF NOT EXISTS links (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -484,14 +504,14 @@ class MainWindow(QMainWindow):
             if link[3]:
                 item.setToolTip(f"Tags: {link[3]}")
             
-            # Set a white shape instead of the actual thumbnail icon
-            pixmap = QPixmap(100, 75)
-            pixmap.fill(Qt.white)
-            item.setIcon(QIcon(pixmap))
-            
-            # Start background fetcher just to download it (if it doesn't exist)
             local_path = os.path.join(THUMBNAILS_DIR, f"{link[0]}.jpg")
-            if not os.path.exists(local_path):
+            if os.path.exists(local_path):
+                item.setIcon(QIcon(load_pixmap(local_path, 100, 75)))
+            else:
+                # Show white placeholder until thumbnail is downloaded
+                px = QPixmap(100, 75)
+                px.fill(Qt.white)
+                item.setIcon(QIcon(px))
                 fetcher = ThumbnailFetcher(link[0], link[2])
                 fetcher.finished.connect(self.on_thumbnail_fetched)
                 self.fetchers.append(fetcher)
@@ -505,16 +525,12 @@ class MainWindow(QMainWindow):
         for i in range(self.list_widget.count()):
             item = self.list_widget.item(i)
             if item.data(Qt.UserRole) == link_id:
-                pixmap = QPixmap(100, 75)
-                pixmap.fill(Qt.white)
-                item.setIcon(QIcon(pixmap))
+                item.setIcon(QIcon(load_pixmap(local_path, 100, 75)))
                 break
         
-        # If the fetched thumbnail belongs to the currently selected link, update the preview with a white shape
+        # If the fetched thumbnail belongs to the currently selected link, update the preview
         if self.current_link_id == link_id:
-            pixmap = QPixmap(200, 150)
-            pixmap.fill(Qt.white)
-            self.thumbnail_preview.setPixmap(pixmap)
+            self.thumbnail_preview.setPixmap(load_pixmap(local_path, 200, 150))
 
     def populate_tag_combo(self):
         current = self.tag_combo.currentText()
@@ -560,10 +576,9 @@ class MainWindow(QMainWindow):
                 pass
         self.stats_label.setText(f"Visits: {visits}  |  Last visited: {last}")
 
-        # Update thumbnail preview to a white shape
-        pixmap = QPixmap(200, 150)
-        pixmap.fill(Qt.white)
-        self.thumbnail_preview.setPixmap(pixmap)
+        # Update thumbnail preview using Pillow-based loader
+        local_path = os.path.join(THUMBNAILS_DIR, f"{link_id}.jpg")
+        self.thumbnail_preview.setPixmap(load_pixmap(local_path, 200, 150))
 
     # ---------- CRUD operations ----------
     def add_link_dialog(self):
