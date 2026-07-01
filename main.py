@@ -690,6 +690,14 @@ class MainWindow(QMainWindow):
         self.browser_tabs = QTabWidget()
         self.browser_tabs.setDocumentMode(True)
         self.browser_tabs.setTabsClosable(True)
+        self.browser_tabs.tabBar().setElideMode(Qt.ElideRight)
+        self.browser_tabs.setStyleSheet("""
+            QTabBar::tab {
+                max-width: 150px;
+                min-width: 40px;
+                padding: 4px 8px;
+            }
+        """)
         self.browser_tabs.tabCloseRequested.connect(self.close_browser_tab)
         self.browser_tabs.currentChanged.connect(self.on_browser_tab_changed)
         browser_layout.addWidget(self.browser_tabs)
