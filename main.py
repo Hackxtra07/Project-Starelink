@@ -6,6 +6,7 @@ import urllib.request
 import urllib.parse
 import re
 from datetime import datetime
+import html as _html
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_NAME = os.path.join(SCRIPT_DIR, "links.db")
@@ -306,7 +307,7 @@ class ThumbnailFetcher(QThread):
 class MetadataFetcher(QThread):
     """Background thread: extracts tags and cast/actor names from a URL.
     Uses yt-dlp for video sites and HTML scraping for everything else."""
-    metadata_ready = pyqtSignal(int, str, str)  # link_id, tags_csv, cast_csv
+    metadata_ready = pyqtSignal(int, str, str, str)  # link_id, tags_csv, cast_csv, title
 
     USER_AGENT = (
         "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
@@ -486,14 +487,31 @@ class MetadataFetcher(QThread):
                         val = m.group(1).strip()
                         if val and val not in cast:
                             cast.append(val)
-
             except Exception as e:
                 print(f"[MetadataFetcher] HTML scraping failed for {url}: {e}")
+
+        scraped_title = ""
+        # ── Strategy 3: Grab title from yt-dlp or HTML ──
+        try:
+            if 'info' in locals() and info.get('title'):
+                scraped_title = info.get('title')
+            elif 'html' in locals():
+                m_title = re.search(r'<title>(.*?)</title>', html, re.I | re.S)
+                if m_title:
+                    scraped_title = m_title.group(1).strip()
+            if scraped_title:
+                # Strip common site tags/branding
+                scraped_title = re.sub(r'\s*[|\-–]\s*(xhamster|xnxx|porn|youtube)[^$]*$', '', scraped_title, flags=re.I).strip()
+                # Decode HTML entities (e.g. &amp;, &#39;)
+                scraped_title = _html.unescape(scraped_title)
+        except Exception:
+            pass
 
         self.metadata_ready.emit(
             self.link_id,
             ", ".join(tags[:12]),
-            ", ".join(cast[:8])
+            ", ".join(cast[:8]),
+            scraped_title
         )
 
 
@@ -791,6 +809,9 @@ class MainWindow(QMainWindow):
         # F5      => Reload browser
         QShortcut(QKeySequence("F5"), self).activated.connect(self.browser_reload)
 
+        # Connect system clipboard changed signal to monitor external browser URLs
+        QApplication.clipboard().dataChanged.connect(self.on_clipboard_changed)
+
 
 
     # ---------- Link list operations ----------
@@ -926,7 +947,7 @@ class MainWindow(QMainWindow):
 
         mf = MetadataFetcher(self.current_link_id, url)
 
-        def on_manual_fetched(link_id, tags, cast):
+        def on_manual_fetched(link_id, tags, cast, title):
             self.fetch_meta_btn.setEnabled(True)
             self.fetch_meta_btn.setText("🔄 Fetch Tags & Cast")
             if link_id == self.current_link_id:
@@ -937,12 +958,14 @@ class MainWindow(QMainWindow):
                 # Auto save changes to the DB too
                 self.db.update_link(
                     link_id,
-                    self.title_edit.text().strip(),
+                    self.title_edit.text().strip() if not title else title,
                     self.url_edit.text().strip(),
                     self.tags_edit.text().strip(),
                     self.notes_edit.toPlainText().strip(),
                     self.cast_edit.text().strip()
                 )
+                if title:
+                    self.title_edit.setText(title)
                 QMessageBox.information(self, "Success", f"Metadata extracted successfully!\n\nTags: {tags}\nCast: {cast}")
             else:
                 self.db.update_metadata(link_id, tags, cast)
@@ -962,10 +985,20 @@ class MainWindow(QMainWindow):
         self.meta_fetchers.append(mf)
         mf.start()
 
-    def on_metadata_fetched(self, link_id, tags, cast):
+    def on_metadata_fetched(self, link_id, tags, cast, title):
         """Called when MetadataFetcher finishes. Updates DB and refreshes UI."""
         self.db.update_metadata(link_id, tags, cast)
-        # If the link is currently selected, refresh the fields live
+        # Auto-update fallback/generic titles with real page titles
+        if title:
+            link = self.db.get_link(link_id)
+            if link:
+                curr_title = link[1]
+                if not curr_title or curr_title == "xHamster Video" or curr_title == clean_title_from_url(link[2]):
+                    self.db.cursor.execute('UPDATE links SET title=? WHERE id=?', (title, link_id))
+                    self.db.conn.commit()
+                    if self.current_link_id == link_id:
+                        self.title_edit.setText(title)
+        # If the link is currently selected, refresh fields live
         if self.current_link_id == link_id:
             if tags and not self.tags_edit.text().strip():
                 self.tags_edit.setText(tags)
@@ -1185,6 +1218,29 @@ class MainWindow(QMainWindow):
                     self.db.cursor.execute("UPDATE links SET title = ? WHERE id = ?", (clean_title, link_id))
                     self.db.conn.commit()
                     self.refresh_list()
+
+    def on_clipboard_changed(self):
+        """Monitor clipboard for external browser copy events."""
+        if not hasattr(self, 'auto_save_checkbox') or not self.auto_save_checkbox.isChecked():
+            return
+        clipboard = QApplication.clipboard()
+        text = clipboard.text().strip()
+        if not text:
+            return
+        if 'xhamster.com/videos/' in text.lower():
+            self.db.cursor.execute("SELECT id FROM links WHERE url = ?", (text,))
+            if self.db.cursor.fetchone() is None:
+                title = clean_title_from_url(text)
+                link_id = self.db.add_link(title, text, tags="", notes="", cast="")
+                self.refresh_list()
+
+                if not hasattr(self, 'fetchers'):
+                    self.fetchers = []
+                fetcher = ThumbnailFetcher(link_id, text)
+                fetcher.finished.connect(self.on_thumbnail_fetched)
+                self.fetchers.append(fetcher)
+                fetcher.start()
+                self._start_metadata_fetcher(link_id, text)
 
     def open_proxy_settings(self):
         """Open a dialog to configure HTTP proxy for the browser."""
