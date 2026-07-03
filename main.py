@@ -108,6 +108,18 @@ class LinkManager:
             self.cursor.execute("ALTER TABLE links ADD COLUMN cast TEXT")
         except sqlite3.OperationalError:
             pass  # Column already exists
+        
+        # Create pornstars table
+        self.cursor.execute("""
+            CREATE TABLE IF NOT EXISTS pornstars (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                tags TEXT,
+                notes TEXT,
+                ref_video_url TEXT,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
         self.conn.commit()
 
     def add_link(self, title, url, tags="", notes="", cast=""):
@@ -192,6 +204,89 @@ class LinkManager:
                 for t in row[0].split(','):
                     tags.add(t.strip())
         return sorted(tags)
+
+    def add_pornstar(self, name, tags="", notes="", ref_video_url=""):
+        self.cursor.execute(
+            'INSERT INTO pornstars (name, tags, notes, ref_video_url) VALUES (?, ?, ?, ?)',
+            (name, tags, notes, ref_video_url)
+        )
+        self.conn.commit()
+        return self.cursor.lastrowid
+
+    def update_pornstar(self, ps_id, name, tags, notes, ref_video_url):
+        self.cursor.execute(
+            'UPDATE pornstars SET name=?, tags=?, notes=?, ref_video_url=? WHERE id=?',
+            (name, tags, notes, ref_video_url, ps_id)
+        )
+        self.conn.commit()
+
+    def delete_pornstar(self, ps_id):
+        self.cursor.execute("DELETE FROM pornstars WHERE id=?", (ps_id,))
+        self.conn.commit()
+
+    def get_all_pornstars(self, search_term="", tag_filter=""):
+        query = "SELECT * FROM pornstars WHERE 1=1"
+        params = []
+        if search_term:
+            query += " AND (name LIKE ? OR tags LIKE ? OR notes LIKE ? OR ref_video_url LIKE ?)"
+            like = f"%{search_term}%"
+            params.extend([like, like, like, like])
+        if tag_filter:
+            query += " AND tags LIKE ?"
+            params.append(f"%{tag_filter}%")
+        query += " ORDER BY name ASC"
+        self.cursor.execute(query, params)
+        return self.cursor.fetchall()
+
+    def get_all_pornstar_tags(self):
+        self.cursor.execute("SELECT tags FROM pornstars")
+        rows = self.cursor.fetchall()
+        tags = set()
+        for row in rows:
+            if row[0]:
+                for t in row[0].split(','):
+                    tags.add(t.strip())
+        return sorted(tags)
+
+    def get_pornstar_by_name(self, name):
+        """Case-insensitive lookup of a model by name."""
+        self.cursor.execute(
+            "SELECT * FROM pornstars WHERE LOWER(name) = LOWER(?)", (name.strip(),)
+        )
+        return self.cursor.fetchone()
+
+    def get_links_by_cast(self, name):
+        """Return all links where the cast field contains this model's name."""
+        self.cursor.execute(
+            'SELECT * FROM links WHERE "cast" LIKE ? ORDER BY created_at DESC',
+            (f"%{name}%",)
+        )
+        return self.cursor.fetchall()
+
+    def update_pornstar_merge(self, ps_id, extra_tags, extra_notes, ref_url=""):
+        """Merge new tags/notes into existing model, set ref_url if blank."""
+        self.cursor.execute("SELECT tags, notes, ref_video_url FROM pornstars WHERE id=?", (ps_id,))
+        row = self.cursor.fetchone()
+        if not row:
+            return
+        existing_tags, existing_notes, existing_ref = row
+        # Merge tags
+        existing_set = set(t.strip() for t in (existing_tags or "").split(',') if t.strip())
+        new_set = set(t.strip() for t in extra_tags.split(',') if t.strip())
+        merged_tags = ", ".join(sorted(existing_set | new_set))
+        # Merge notes
+        new_note = extra_notes.strip()
+        if new_note and new_note not in (existing_notes or ""):
+            merged_notes = ((existing_notes or "") + "\n" + new_note).strip()
+        else:
+            merged_notes = existing_notes or ""
+        # Set ref_url only if currently empty
+        final_ref = existing_ref if existing_ref else ref_url
+        self.cursor.execute(
+            "UPDATE pornstars SET tags=?, notes=?, ref_video_url=? WHERE id=?",
+            (merged_tags, merged_notes, final_ref, ps_id)
+        )
+        self.conn.commit()
 
     def close(self):
         self.conn.close()
@@ -402,10 +497,18 @@ class MetadataFetcher(QThread):
                 info = ydl.extract_info(url, download=False)
                 if info.get('tags'):
                     tags = [t.strip() for t in info['tags'] if t.strip()][:12]
-                for key in ('artist', 'creator', 'uploader', 'channel'):
+                # Extract cast/actors from yt-dlp info
+                for key in ('artist', 'creator'):
                     val = info.get(key, '')
                     if val and val not in cast:
                         cast.append(val)
+                # actors field (list)
+                actors_field = info.get('actors', [])
+                if isinstance(actors_field, list):
+                    for a in actors_field:
+                        name = a.get('name') if isinstance(a, dict) else str(a)
+                        if name and name not in cast:
+                            cast.append(name)
         except Exception:
             pass
 
@@ -477,11 +580,29 @@ class MetadataFetcher(QThread):
                                         cast.append(name)
                         except Exception:
                             pass
-
                 # ── Generic: og:video:actor ──
                 if not cast:
                     for m in re.finditer(
                         r'<meta[^>]+property=["\']og:video:actor["\'][^>]+content=["\']([^"\']+)["\']',
+                        html, re.I
+                    ):
+                        val = m.group(1).strip()
+                        if val and val not in cast:
+                            cast.append(val)
+                # ── Generic: pornstar/model anchor links (any site) ──
+                if not cast:
+                    for m in re.finditer(
+                        r'href=["\'](?:https?://[^"\'/]*)?/(?:pornstars?|models?|actors?|performers?|star)/'
+                        r'[^"\'>]+["\'][^>]*>([^<]{1,80})</a>',
+                        html, re.I
+                    ):
+                        name = m.group(1).strip()
+                        if name and name.lower() not in ('all models', 'more', 'see all', 'view all') and name not in cast:
+                            cast.append(name)
+                # ── Generic: data-performer / data-actress attributes ──
+                if not cast:
+                    for m in re.finditer(
+                        r'data-(?:performer|actress|actor|model|star)=["\']([^"\']{1,80})["\']',
                         html, re.I
                     ):
                         val = m.group(1).strip()
@@ -703,6 +824,10 @@ class MainWindow(QMainWindow):
 
         # Add manager tab
         self.tabs.addTab(self.manager_widget, "📁 Links")
+
+        # ------------------- Tab 1.5: Models -------------------
+        self.init_pornstars_tab()
+        self.tabs.addTab(self.pornstars_widget, "💃 Models")
 
         # ------------------- Tab 2: Browser -------------------
         self.browser_widget = QWidget()
@@ -966,9 +1091,17 @@ class MainWindow(QMainWindow):
                 )
                 if title:
                     self.title_edit.setText(title)
-                QMessageBox.information(self, "Success", f"Metadata extracted successfully!\n\nTags: {tags}\nCast: {cast}")
+                # ── Auto-save models from extracted cast ──
+                video_url = self.url_edit.text().strip()
+                self.auto_save_models_from_cast(link_id, tags, cast, video_url)
+                QMessageBox.information(self, "Success",
+                    f"Metadata extracted!\n\nTags: {tags}\nCast: {cast}\n\n"
+                    f"Models in cast auto-saved to the Models tab.")
             else:
                 self.db.update_metadata(link_id, tags, cast)
+                link = self.db.get_link(link_id)
+                video_url = link[2] if link else ""
+                self.auto_save_models_from_cast(link_id, tags, cast, video_url)
             self.refresh_list()
 
         mf.metadata_ready.connect(on_manual_fetched)
@@ -1004,6 +1137,10 @@ class MainWindow(QMainWindow):
                 self.tags_edit.setText(tags)
             if cast and not self.cast_edit.text().strip():
                 self.cast_edit.setText(cast)
+        # ── Auto-save any newly discovered models ──
+        link = self.db.get_link(link_id)
+        video_url = link[2] if link else ""
+        self.auto_save_models_from_cast(link_id, tags, cast, video_url)
         self.refresh_list()
 
     def save_link(self):
@@ -1026,6 +1163,8 @@ class MainWindow(QMainWindow):
             if item.data(Qt.UserRole) == self.current_link_id:
                 item.setText(title)
                 break
+        # ── Auto-save models from manually typed cast field ──
+        self.auto_save_models_from_cast(self.current_link_id, tags, cast, url)
         QMessageBox.information(self, "Success", "Link updated.")
 
     def delete_link(self):
@@ -1062,7 +1201,7 @@ class MainWindow(QMainWindow):
         # Record visit
         self.db.record_visit(self.current_link_id)
         # Switch to browser tab and load
-        self.tabs.setCurrentIndex(1)  # browser tab
+        self.tabs.setCurrentIndex(self.tabs.indexOf(self.browser_widget))
         self.add_browser_tab(QUrl(url), link[1])
         # Update stats
         self.on_link_selected(self.list_widget.currentItem())
@@ -1227,7 +1366,14 @@ class MainWindow(QMainWindow):
         text = clipboard.text().strip()
         if not text:
             return
-        if 'xhamster.com/videos/' in text.lower():
+        # Prevent infinite loops / multiple triggers for same URL
+        if getattr(self, '_last_handled_clipboard', None) == text:
+            return
+
+        # Check for xhamster pattern anywhere in the copied text
+        if 'xhamster' in text.lower() and '/videos/' in text.lower():
+            self._last_handled_clipboard = text
+            print(f"[Clipboard Monitor] Found xHamster video URL: {text}")
             self.db.cursor.execute("SELECT id FROM links WHERE url = ?", (text,))
             if self.db.cursor.fetchone() is None:
                 title = clean_title_from_url(text)
@@ -1241,6 +1387,329 @@ class MainWindow(QMainWindow):
                 self.fetchers.append(fetcher)
                 fetcher.start()
                 self._start_metadata_fetcher(link_id, text)
+                if self.statusBar():
+                    self.statusBar().showMessage(f"Auto-saved: {title}", 3000)
+
+    # ---------- Models / Pornstars Tab Operations ----------
+    def init_pornstars_tab(self):
+        self.pornstars_widget = QWidget()
+        layout = QVBoxLayout(self.pornstars_widget)
+
+        # Top controls
+        controls = QHBoxLayout()
+        self.p_search_input = QLineEdit()
+        self.p_search_input.setPlaceholderText("Search models...")
+        self.p_search_input.textChanged.connect(self.refresh_pornstars_list)
+        controls.addWidget(QLabel("Search:"))
+        controls.addWidget(self.p_search_input)
+
+        self.p_tag_combo = QComboBox()
+        self.p_tag_combo.addItem("All Tags")
+        self.p_tag_combo.currentTextChanged.connect(self.refresh_pornstars_list)
+        controls.addWidget(QLabel("Tag:"))
+        controls.addWidget(self.p_tag_combo)
+
+        controls.addStretch()
+        add_p_btn = QPushButton("➕ Add Model")
+        add_p_btn.clicked.connect(self.add_pornstar_dialog)
+        controls.addWidget(add_p_btn)
+
+        # Auto-extract button: scan all links and populate missing models
+        auto_extract_btn = QPushButton("🔍 Auto-Extract All Models")
+        auto_extract_btn.setToolTip(
+            "Scan all saved video links and automatically create model entries\n"
+            "for any cast member not already in the Models tab."
+        )
+        auto_extract_btn.clicked.connect(self.auto_extract_all_models)
+        controls.addWidget(auto_extract_btn)
+
+        layout.addLayout(controls)
+
+        # Main horizontal splitter: left = model list, right = details + videos
+        outer_splitter = QSplitter(Qt.Horizontal)
+        self.p_list_widget = QListWidget()
+        self.p_list_widget.itemClicked.connect(self.on_pornstar_selected)
+        outer_splitter.addWidget(self.p_list_widget)
+
+        # Right side: vertical splitter (top = details, bottom = associated videos)
+        right_splitter = QSplitter(Qt.Vertical)
+
+        # ── Details panel ──
+        detail_widget = QWidget()
+        detail_layout = QGridLayout(detail_widget)
+
+        detail_layout.addWidget(QLabel("Name:"), 0, 0)
+        self.p_name_edit = QLineEdit()
+        detail_layout.addWidget(self.p_name_edit, 0, 1)
+
+        detail_layout.addWidget(QLabel("Tags:"), 1, 0)
+        self.p_tags_edit = QLineEdit()
+        self.p_tags_edit.setPlaceholderText("comma separated")
+        detail_layout.addWidget(self.p_tags_edit, 1, 1)
+
+        detail_layout.addWidget(QLabel("Reference Video URL:"), 2, 0)
+        self.p_ref_url_edit = QLineEdit()
+        detail_layout.addWidget(self.p_ref_url_edit, 2, 1)
+
+        detail_layout.addWidget(QLabel("Notes:"), 3, 0)
+        self.p_notes_edit = QTextEdit()
+        self.p_notes_edit.setMaximumHeight(100)
+        detail_layout.addWidget(self.p_notes_edit, 3, 1)
+
+        # Thumbnail preview for reference video
+        detail_layout.addWidget(QLabel("Ref Thumbnail:"), 4, 0)
+        self.p_thumb_preview = QLabel("")
+        self.p_thumb_preview.setAlignment(Qt.AlignCenter)
+        self.p_thumb_preview.setFixedSize(200, 150)
+        self.p_thumb_preview.setStyleSheet(
+            "border: 1px solid #ccc; background-color: #1a1a2e; border-radius: 4px;"
+        )
+        detail_layout.addWidget(self.p_thumb_preview, 4, 1)
+
+        # Buttons
+        btn_layout = QHBoxLayout()
+        self.p_save_btn = QPushButton("💾 Save")
+        self.p_save_btn.clicked.connect(self.save_pornstar)
+        btn_layout.addWidget(self.p_save_btn)
+
+        self.p_delete_btn = QPushButton("🗑️ Delete")
+        self.p_delete_btn.clicked.connect(self.delete_pornstar)
+        btn_layout.addWidget(self.p_delete_btn)
+
+        self.p_open_ref_btn = QPushButton("🌐 Open Ref Video")
+        self.p_open_ref_btn.clicked.connect(self.open_pornstar_ref_video)
+        btn_layout.addWidget(self.p_open_ref_btn)
+
+        detail_layout.addLayout(btn_layout, 5, 0, 1, 2)
+
+        right_splitter.addWidget(detail_widget)
+
+        # ── Associated Videos panel ──
+        assoc_widget = QWidget()
+        assoc_layout = QVBoxLayout(assoc_widget)
+        assoc_layout.addWidget(QLabel("📹 Associated Videos (double-click to open):"))
+        self.p_videos_list = QListWidget()
+        self.p_videos_list.setIconSize(QSize(80, 60))
+        self.p_videos_list.itemDoubleClicked.connect(self.open_associated_video)
+        assoc_layout.addWidget(self.p_videos_list)
+        right_splitter.addWidget(assoc_widget)
+
+        right_splitter.setSizes([380, 220])
+        outer_splitter.addWidget(right_splitter)
+        outer_splitter.setSizes([350, 850])
+        layout.addWidget(outer_splitter)
+
+        self.current_pornstar_id = None
+        self.refresh_pornstars_list()
+
+    def refresh_pornstars_list(self):
+        self.p_list_widget.clear()
+        search_term = self.p_search_input.text().strip()
+        tag_filter = self.p_tag_combo.currentText()
+        if tag_filter == "All Tags":
+            tag_filter = ""
+        pornstars = self.db.get_all_pornstars(search_term, tag_filter)
+        for ps in pornstars:
+            item = QListWidgetItem(ps[1])  # name
+            item.setData(Qt.UserRole, ps[0])  # id
+            if ps[2]:
+                item.setToolTip(f"Tags: {ps[2]}")
+            self.p_list_widget.addItem(item)
+        self.populate_pornstar_tag_combo()
+
+    def populate_pornstar_tag_combo(self):
+        current = self.p_tag_combo.currentText()
+        self.p_tag_combo.blockSignals(True)
+        self.p_tag_combo.clear()
+        self.p_tag_combo.addItem("All Tags")
+        tags = self.db.get_all_pornstar_tags()
+        self.p_tag_combo.addItems(tags)
+        if current in tags:
+            self.p_tag_combo.setCurrentText(current)
+        else:
+            self.p_tag_combo.setCurrentText("All Tags")
+        self.p_tag_combo.blockSignals(False)
+
+    def add_pornstar_dialog(self):
+        name, ok1 = QInputDialog.getText(self, "Add Model", "Name:")
+        if not ok1 or not name.strip():
+            return
+        tags, ok2 = QInputDialog.getText(self, "Add Model", "Tags (comma separated):")
+        if not ok2:
+            tags = ""
+        ref_video_url, ok3 = QInputDialog.getText(self, "Add Model", "Reference Video URL:")
+        if not ok3:
+            ref_video_url = ""
+        self.db.add_pornstar(name.strip(), tags.strip(), "", ref_video_url.strip())
+        self.refresh_pornstars_list()
+        self.clear_pornstar_details()
+
+    def clear_pornstar_details(self):
+        self.p_name_edit.clear()
+        self.p_tags_edit.clear()
+        self.p_notes_edit.clear()
+        self.p_ref_url_edit.clear()
+        self.p_videos_list.clear()
+        px = QPixmap(200, 150)
+        px.fill(Qt.transparent)
+        self.p_thumb_preview.setPixmap(px)
+        self.p_thumb_preview.setText("")
+        self.current_pornstar_id = None
+
+    def on_pornstar_selected(self, item):
+        ps_id = item.data(Qt.UserRole)
+        self.db.cursor.execute("SELECT * FROM pornstars WHERE id=?", (ps_id,))
+        ps = self.db.cursor.fetchone()
+        if not ps:
+            return
+        self.current_pornstar_id = ps_id
+        self.p_name_edit.setText(ps[1] or "")
+        self.p_tags_edit.setText(ps[2] or "")
+        self.p_notes_edit.setText(ps[3] or "")
+        self.p_ref_url_edit.setText(ps[4] or "")
+
+        # ── Show thumbnail for reference video ──
+        ref_url = ps[4] or ""
+        thumb_shown = False
+        if ref_url:
+            # Find the link in DB by URL to get its thumbnail
+            self.db.cursor.execute("SELECT id FROM links WHERE url=?", (ref_url,))
+            ref_row = self.db.cursor.fetchone()
+            if ref_row:
+                local_path = os.path.join(THUMBNAILS_DIR, f"{ref_row[0]}.jpg")
+                if os.path.exists(local_path):
+                    self.p_thumb_preview.setPixmap(load_pixmap(local_path, 200, 150))
+                    thumb_shown = True
+        if not thumb_shown:
+            px = QPixmap(200, 150)
+            px.fill(Qt.transparent)
+            self.p_thumb_preview.setPixmap(px)
+            self.p_thumb_preview.setText("No thumbnail")
+
+        # ── Load associated videos ──
+        self.p_videos_list.clear()
+        name = ps[1] or ""
+        assoc_links = self.db.get_links_by_cast(name)
+        for lnk in assoc_links:
+            litem = QListWidgetItem(lnk[1])  # title
+            litem.setData(Qt.UserRole, lnk[2])  # store URL
+            local_path = os.path.join(THUMBNAILS_DIR, f"{lnk[0]}.jpg")
+            if os.path.exists(local_path):
+                litem.setIcon(QIcon(load_pixmap(local_path, 80, 60)))
+            else:
+                px = QPixmap(80, 60)
+                px.fill(Qt.darkGray)
+                litem.setIcon(QIcon(px))
+            self.p_videos_list.addItem(litem)
+
+    def save_pornstar(self):
+        if self.current_pornstar_id is None:
+            QMessageBox.warning(self, "Warning", "No model selected.")
+            return
+        name = self.p_name_edit.text().strip()
+        if not name:
+            QMessageBox.warning(self, "Warning", "Name cannot be empty.")
+            return
+        tags = self.p_tags_edit.text().strip()
+        notes = self.p_notes_edit.toPlainText().strip()
+        ref_url = self.p_ref_url_edit.text().strip()
+        self.db.update_pornstar(self.current_pornstar_id, name, tags, notes, ref_url)
+        self.refresh_pornstars_list()
+        QMessageBox.information(self, "Success", "Model info updated.")
+
+    def delete_pornstar(self):
+        if self.current_pornstar_id is None:
+            return
+        reply = QMessageBox.question(self, "Confirm", "Delete this model entry?",
+                                     QMessageBox.Yes | QMessageBox.No)
+        if reply == QMessageBox.Yes:
+            self.db.delete_pornstar(self.current_pornstar_id)
+            self.refresh_pornstars_list()
+            self.clear_pornstar_details()
+
+    def open_pornstar_ref_video(self):
+        url = self.p_ref_url_edit.text().strip()
+        if not url:
+            return
+        # Open in the internal browser tab
+        self.add_browser_tab(QUrl(url), "Reference Video")
+        # Switch to browser tab (Browser widget tab index)
+        self.tabs.setCurrentIndex(self.tabs.indexOf(self.browser_widget))
+
+    def open_associated_video(self, item):
+        """Open an associated video from the Models tab associated videos list."""
+        url = item.data(Qt.UserRole)
+        if url:
+            if not url.startswith(("http://", "https://")):
+                url = "http://" + url
+            self.add_browser_tab(QUrl(url), item.text())
+            self.tabs.setCurrentIndex(self.tabs.indexOf(self.browser_widget))
+
+    def auto_save_models_from_cast(self, link_id, tags, cast_csv, video_url=""):
+        """Parse cast CSV and auto-create/merge model entries in the pornstars DB."""
+        if not cast_csv or not cast_csv.strip():
+            return
+        names = [n.strip() for n in cast_csv.split(',') if n.strip()]
+        changed = False
+        for name in names:
+            if len(name) < 2 or len(name) > 100:
+                continue  # Skip garbage
+            existing = self.db.get_pornstar_by_name(name)
+            note = f"Auto-linked from video: {video_url}" if video_url else "Auto-detected from video metadata"
+            if existing:
+                # Merge: add new tags, append note about this video, set ref_url if empty
+                self.db.update_pornstar_merge(
+                    existing[0],
+                    extra_tags=tags,
+                    extra_notes=note,
+                    ref_url=video_url
+                )
+            else:
+                # Create new model entry
+                self.db.add_pornstar(
+                    name=name,
+                    tags=tags,
+                    notes=note,
+                    ref_video_url=video_url
+                )
+            changed = True
+        if changed:
+            self.refresh_pornstars_list()
+
+    def auto_extract_all_models(self):
+        """Scan all saved links and run auto_save_models_from_cast for each with a cast."""
+        all_links = self.db.get_all_links()
+        links_with_cast = [(l[0], l[3], l[8], l[2]) for l in all_links if (l[8] or "").strip()]
+        if not links_with_cast:
+            QMessageBox.information(
+                self, "Auto-Extract Models",
+                "No links with cast information found.\n"
+                "Use 'Fetch Tags & Cast' on your links first to populate the Cast field."
+            )
+            return
+        reply = QMessageBox.question(
+            self, "Auto-Extract Models",
+            f"Scan {len(links_with_cast)} link(s) with cast info and auto-create/update model entries?\n"
+            "This will add any missing models to the Models tab.",
+            QMessageBox.Yes | QMessageBox.No
+        )
+        if reply != QMessageBox.Yes:
+            return
+        count_new = 0
+        for link_id, tags, cast_csv, video_url in links_with_cast:
+            names = [n.strip() for n in (cast_csv or "").split(',') if n.strip()]
+            for name in names:
+                if len(name) < 2:
+                    continue
+                if not self.db.get_pornstar_by_name(name):
+                    count_new += 1
+            self.auto_save_models_from_cast(link_id, tags or "", cast_csv or "", video_url or "")
+        self.refresh_pornstars_list()
+        QMessageBox.information(
+            self, "Auto-Extract Complete",
+            f"Processed {len(links_with_cast)} link(s).\n"
+            f"Added {count_new} new model(s) to the Models tab."
+        )
 
     def open_proxy_settings(self):
         """Open a dialog to configure HTTP proxy for the browser."""
