@@ -35,11 +35,23 @@ except ImportError:
     _PIL_AVAILABLE = False
 
 
+_PIXMAP_CACHE = {}
+
+def invalidate_pixmap_cache(path):
+    """Clear cached pixmaps for a specific file path."""
+    keys_to_delete = [k for k in _PIXMAP_CACHE if k[0] == path]
+    for k in keys_to_delete:
+        del _PIXMAP_CACHE[k]
+
 def load_pixmap(path, width=200, height=150):
     """Load an image via Pillow → in-memory PNG → QPixmap.
     Qt's PNG decoder is built-in (no plugin needed), so this is
     reliable even when the JPEG Qt plugin is missing.
     Falls back to a plain white QPixmap on any error."""
+    cache_key = (path, width, height)
+    if cache_key in _PIXMAP_CACHE:
+        return _PIXMAP_CACHE[cache_key]
+
     if _PIL_AVAILABLE and os.path.exists(path):
         try:
             img = PILImage.open(path).convert("RGB")
@@ -49,12 +61,14 @@ def load_pixmap(path, width=200, height=150):
             px = QPixmap()
             px.loadFromData(buf.getvalue(), "PNG")
             if not px.isNull():
+                _PIXMAP_CACHE[cache_key] = px
                 return px
         except Exception as _e:
             print(f"[load_pixmap] {path}: {_e}")
     # Fallback: solid white placeholder
     px = QPixmap(width, height)
     px.fill(Qt.white)
+    _PIXMAP_CACHE[cache_key] = px
     return px
 
 
@@ -159,22 +173,24 @@ class LinkManager:
         query = "SELECT * FROM links WHERE 1=1"
         params = []
         if search_term:
-            like = f"%{search_term}%"
-            if search_field == "Title":
-                query += " AND title LIKE ?"
-                params.append(like)
-            elif search_field == "URL":
-                query += " AND url LIKE ?"
-                params.append(like)
-            elif search_field == "Tags":
-                query += " AND tags LIKE ?"
-                params.append(like)
-            elif search_field == "Cast":
-                query += ' AND "cast" LIKE ?'
-                params.append(like)
-            else:  # All Fields
-                query += ' AND (title LIKE ? OR url LIKE ? OR tags LIKE ? OR "cast" LIKE ?)'
-                params.extend([like, like, like, like])
+            terms = search_term.strip().split()
+            for term in terms:
+                like = f"%{term}%"
+                if search_field == "Title":
+                    query += " AND title LIKE ?"
+                    params.append(like)
+                elif search_field == "URL":
+                    query += " AND url LIKE ?"
+                    params.append(like)
+                elif search_field == "Tags":
+                    query += " AND tags LIKE ?"
+                    params.append(like)
+                elif search_field == "Cast":
+                    query += ' AND "cast" LIKE ?'
+                    params.append(like)
+                else:  # All Fields
+                    query += ' AND (title LIKE ? OR url LIKE ? OR tags LIKE ? OR "cast" LIKE ?)'
+                    params.extend([like, like, like, like])
         if tag_filter:
             query += " AND tags LIKE ?"
             params.append(f"%{tag_filter}%")
@@ -228,9 +244,11 @@ class LinkManager:
         query = "SELECT * FROM pornstars WHERE 1=1"
         params = []
         if search_term:
-            query += " AND (name LIKE ? OR tags LIKE ? OR notes LIKE ? OR ref_video_url LIKE ?)"
-            like = f"%{search_term}%"
-            params.extend([like, like, like, like])
+            terms = search_term.strip().split()
+            for term in terms:
+                query += " AND (name LIKE ? OR tags LIKE ? OR notes LIKE ? OR ref_video_url LIKE ?)"
+                like = f"%{term}%"
+                params.extend([like, like, like, like])
         if tag_filter:
             query += " AND tags LIKE ?"
             params.append(f"%{tag_filter}%")
@@ -976,6 +994,7 @@ class MainWindow(QMainWindow):
         self.populate_tag_combo()
 
     def on_thumbnail_fetched(self, link_id, local_path):
+        invalidate_pixmap_cache(local_path)
         for i in range(self.list_widget.count()):
             item = self.list_widget.item(i)
             if item.data(Qt.UserRole) == link_id:
@@ -1333,6 +1352,7 @@ class MainWindow(QMainWindow):
 
                 if not hasattr(self, 'fetchers'):
                     self.fetchers = []
+                self.fetchers = [f for f in self.fetchers if f.isRunning()]
                 fetcher = ThumbnailFetcher(link_id, url)
                 fetcher.finished.connect(self.on_thumbnail_fetched)
                 self.fetchers.append(fetcher)
@@ -1382,6 +1402,7 @@ class MainWindow(QMainWindow):
 
                 if not hasattr(self, 'fetchers'):
                     self.fetchers = []
+                self.fetchers = [f for f in self.fetchers if f.isRunning()]
                 fetcher = ThumbnailFetcher(link_id, text)
                 fetcher.finished.connect(self.on_thumbnail_fetched)
                 self.fetchers.append(fetcher)

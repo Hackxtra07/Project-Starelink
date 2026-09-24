@@ -166,8 +166,16 @@ class VideoDownloaderManager(QObject):
     def download_thread_worker(self, item, download_id):
         self.signals.log.emit(f"Starting download: {item['title']}", "INFO")
         
+        import time
+        last_emit_time = [0.0]
+
         def progress_hook(d):
             if d['status'] == 'downloading':
+                current_time = time.time()
+                if current_time - last_emit_time[0] < 0.2:
+                    return
+                last_emit_time[0] = current_time
+                
                 total = d.get('total_bytes') or d.get('total_bytes_estimate')
                 downloaded = d.get('downloaded_bytes', 0)
                 
